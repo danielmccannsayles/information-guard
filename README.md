@@ -2,7 +2,7 @@
 > Not extensively reviewed or tested. The sandbox uses macOS `sandbox-exec` with `(allow default)` (fail-open). It restricts file reads, and can be configured to prevent writes, but doesn't touch network, process execution, or other operations.
 
 > [!NOTE]
-> **Update (2026-08): Claude's sandboxing approach has changed.** Claude now uses its own built-in sandbox (enabled via `sandbox.enabled` in `~/.claude/settings.json`) plus permission deny rules — not the `information-guard-sandbox` process wrapper. The deny rules are generated from `sandbox.json` via `information-guard-sandbox --print-claude-config`. See [`docs/claude-native-sandbox.md`](docs/claude-native-sandbox.md) for details.
+> **Update (Aug 11): Claude's sandboxing approach has changed.** Claude now uses its own built-in sandbox (enabled via `sandbox.enabled` in `~/.claude/settings.json`) plus permission deny rules — not the `information-guard-sandbox` process wrapper. The deny rules are generated from `sandbox.json` via `information-guard-sandbox --print-claude-config`. See [`docs/claude-native-sandbox.md`](docs/claude-native-sandbox.md) for details.
 
 # information-guard
 
