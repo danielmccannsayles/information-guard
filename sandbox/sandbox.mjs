@@ -24,10 +24,14 @@
 //
 // Usage: information-guard-sandbox <command> [args...]
 //        information-guard-sandbox --print-profile [name]      (show the generated SBPL and exit)
-//        information-guard-sandbox --print-codex-config [name] (emit a codex permissions profile
-//                                                               from the same config, to paste into
-//                                                               ~/.codex/config.toml — codex has its
-//                                                               own Seatbelt sandbox; don't wrap it)
+//        information-guard-sandbox --print-codex-config [name]  (emit a codex permissions profile
+//                                                                 from the same config, to paste into
+//                                                                 ~/.codex/config.toml — codex has its
+//                                                                 own Seatbelt sandbox; don't wrap it)
+//        information-guard-sandbox --print-claude-config [name] (emit a claude-code settings block
+//                                                                 from the same config, to paste into
+//                                                                 ~/.claude/settings.json — claude has
+//                                                                 its own sandbox; don't wrap it)
 //
 // The wrapped command's basename selects a profile from `profiles` in the
 // config (if one matches), so per-agent behavior needs nothing in the alias:
@@ -42,10 +46,16 @@
 // (write-denied) and symlinks ~/.local/bin/information-guard-sandbox to it.
 // The repo source is editable but inert — edits only take effect after
 // re-running install.sh from a human terminal. ~/.local/bin is also
-// write-denied (in SENSITIVE_DOTFILES), so the symlink itself can't be
+// write-denied (in WRITE_PROTECTED_DOTFILES), so the symlink itself can't be
 // repointed by a sandboxed agent.
 
-import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { join, dirname, basename } from "node:path";
@@ -60,9 +70,30 @@ const CONFIG_PATH =
 // PATH executables that run as you) or credentials/tamper targets. Stable
 // across agents and years, unlike per-agent state-dir allowlists.
 // Write-deny only (file-write*); reads are unaffected — agents can still
-// exec tools in ~/.local/bin or read ~/.aws/credentials. For read-protection,
-// add paths to protectedPaths in sandbox.json instead.
-const SENSITIVE_DOTFILES = [
+// exec tools in ~/.local/bin or read ~/.aws/credentials. For read-protection
+// on credentials in the Claude native config, see READ_PROTECTED_CREDENTIALS
+// below (the wrapper keeps reads open so subprocess tools like gh/aws work).
+// For read-protection in the wrapper itself, add paths to protectedPaths.
+// Credentials and secrets — read+write protected in the Claude native
+// config (--print-claude-config emits Read+Edit deny), but write-protected
+// only in the wrapper (so subprocess tools like gh/aws can still read their
+// own credentials to function).
+const READ_PROTECTED_CREDENTIALS = [
+  "~/.ssh",
+  "~/.aws",
+  "~/.netrc",
+  "~/.gnupg",
+  "~/.docker",
+  "~/.config/gh", // gh auth tokens (hosts.yml)
+  "~/.tinfoil",
+];
+
+// Other sensitive dotfiles — write-protected only (reads allowed) in both
+// the wrapper and the Claude native config. These are persistence vectors
+// (shell startup, PATH executables that run as you) or tamper targets
+// (git integrity, the guard's own config). Agents can still read/exec them
+// (e.g. run node from ~/.nvm, read ~/.gitconfig) but not modify them.
+const WRITE_PROTECTED_DOTFILES = [
   // Shell startup (persistence via sourced rc files)
   "~/.zshrc",
   "~/.zshrc.backup",
@@ -72,14 +103,6 @@ const SENSITIVE_DOTFILES = [
   "~/.bashrc",
   "~/.bash_profile",
   "~/.profile",
-  // Credentials and secrets
-  "~/.ssh",
-  "~/.aws",
-  "~/.netrc",
-  "~/.gnupg",
-  "~/.docker",
-  "~/.config/gh", // gh auth tokens (hosts.yml)
-  "~/.tinfoil",
   // Git integrity (hooks, identity)
   "~/.gitconfig", // core.hooksPath — git-guard integrity
   "~/.config/git", // the git-guard hooks themselves
@@ -117,6 +140,20 @@ function realPath(p) {
     return realpathSync(p);
   } catch {
     return p;
+  }
+}
+
+// For a path, return the glob pattern(s) for Claude Code deny rules.
+// Existing dir → ["~/path/**"]. Existing file → ["~/path"]. Non-existent →
+// both (covers either case when the path is created later; re-run
+// --print-claude-config after creating new sensitive paths).
+function claudeDenyGlobs(path) {
+  const tilded = tildePath(path);
+  try {
+    if (statSync(path).isDirectory()) return [`${tilded}/**`];
+    return [tilded];
+  } catch {
+    return [tilded, `${tilded}/**`];
   }
 }
 
@@ -226,8 +263,11 @@ function buildProfile(protectedPaths, containment) {
     // data containment protects.
     lines.push(`(allow file-write* (regex #"^${homedir()}/\\.[^/]*(/|$)"))`);
 
-    // Sensitive dotfiles win over the regex allow (later rules take precedence)
-    for (const s of SENSITIVE_DOTFILES) {
+    // Sensitive dotfiles and credentials win over the regex allow
+    for (const s of [
+      ...READ_PROTECTED_CREDENTIALS,
+      ...WRITE_PROTECTED_DOTFILES,
+    ]) {
       lines.push(`(deny file-write* (subpath "${realPath(expandPath(s))}"))`);
     }
   }
@@ -284,6 +324,68 @@ function main() {
         ``,
         `[permissions.information-guard.filesystem]`,
         ...protectedPaths.map((p) => `"${tildePath(p)}" = "deny"`),
+      ].join("\n"),
+    );
+    process.exit(0);
+  }
+
+  // Claude Code has a built-in sandbox (sandbox-exec wrapping the Bash tool)
+  // and permission deny rules. Unlike the process wrapper, the main process
+  // (auth, keychain, Read/Edit/Write tools) stays unsandboxed — so keychain
+  // writes work and setuid binaries like /bin/ps can run. See
+  // docs/claude-native-sandbox.md for the full rationale.
+  //
+  // Emit protectedPaths + WRITE_PROTECTED_DOTFILES as Claude deny rules, and
+  // writeContainment as the sandbox config. Read(...) deny rules also gate
+  // the Bash tool (Claude merges them into the sandbox), so a protectedPath
+  // is blocked at both the Read tool and Bash level. sandbox.json stays the
+  // single source of truth — re-run after changing it.
+  if (command[0] === "--print-claude-config") {
+    const deny = [];
+    for (const p of protectedPaths) {
+      for (const g of claudeDenyGlobs(p)) {
+        deny.push(`Read(${g})`);
+        deny.push(`Edit(${g})`);
+      }
+    }
+    // Credentials: read+write protected (the LLM should never read raw creds)
+    for (const s of READ_PROTECTED_CREDENTIALS) {
+      for (const g of claudeDenyGlobs(expandPath(s))) {
+        deny.push(`Read(${g})`);
+        deny.push(`Edit(${g})`);
+      }
+    }
+    // Other sensitive dotfiles: write-protected only (reads allowed so
+    // subprocess tools like gh/aws keep working when run via Bash)
+    for (const s of WRITE_PROTECTED_DOTFILES) {
+      for (const g of claudeDenyGlobs(expandPath(s))) {
+        deny.push(`Edit(${g})`);
+      }
+    }
+
+    const config = { permissions: { deny } };
+    if (containment.enabled) {
+      config.sandbox = {
+        enabled: true,
+        filesystem: {
+          allowWrite: containment.allowWrite.map((p) => tildePath(p)),
+        },
+      };
+    }
+
+    console.log(
+      [
+        `// Generated by information-guard from ${CONFIG_PATH}`,
+        `// Paste into ~/.claude/settings.json (merge into permissions.deny + sandbox).`,
+        `// Re-run after changing protectedPaths or writeContainment.`,
+        `//`,
+        `// protectedPaths → Read+Edit deny (read+write protected)`,
+        `// READ_PROTECTED_CREDENTIALS → Read+Edit deny (read+write protected — the LLM`,
+        `//   should never read raw credentials; subprocess tools like gh/aws are also`,
+        `//   blocked from reading them via the Bash sandbox)`,
+        `// WRITE_PROTECTED_DOTFILES → Edit deny only (write-protected, reads allowed —`,
+        `//   agents can still exec tools in ~/.local/bin, read ~/.gitconfig)`,
+        JSON.stringify(config, null, 2),
       ].join("\n"),
     );
     process.exit(0);
